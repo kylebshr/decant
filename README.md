@@ -1,17 +1,17 @@
-# icon-reverse-engineer
+# decant
 
-Reverse-engineer Apple's "Liquid Glass" app icons (the iOS/macOS 26+ `.icon` format) back into an editable `.icon` bundle you can open in Icon Composer. It reads the *compiled* icon straight out of an installed iOS simulator runtime using the private CoreUI framework, recovers every layer (vector SVG / raster PNG) and its full material treatment — blend mode, opacity, translucency, specular, shadow, blur, refraction, glass, per-appearance (light/dark/tinted) fills, layer transforms, and the canvas background — then reassembles a faithful `icon.json` + `Assets/` folder. Every export is verified by re-compiling it with `actool`.
+**Decant** reverse-engineers Apple's "Liquid Glass" app icons (the iOS/macOS 26+ `.icon` format) back into an editable `.icon` bundle you can open in Icon Composer — pouring a sealed, compiled icon back out into editable source. It reads the *compiled* icon straight out of an installed iOS simulator runtime using the private CoreUI framework, recovers every layer (vector SVG / raster PNG) and its full material treatment — blend mode, opacity, translucency, specular, shadow, blur, refraction, glass, per-appearance (light/dark/tinted) fills, layer transforms, and the canvas background — then reassembles a faithful `icon.json` + `Assets/` folder. Every export is verified by re-compiling it with `actool`.
 
 It was built by reverse-engineering and then **round-trip–calibrated**: for each property the rebuilt icon is recompiled and re-extracted, and the values are diffed against Apple's original until they match exactly.
 
 ## Quick start
 
 ```sh
-git clone <your-repo-url> icon-reverse-engineer
-cd icon-reverse-engineer
-./reverse-icon.sh             # export ALL runtime icons → ./icons/
-./reverse-icon.sh --list      # list every extractable icon in your iOS runtime
-./reverse-icon.sh Maps        # just one → ./Maps.icon, then: open Maps.icon
+git clone https://github.com/kylebshr/decant
+cd decant
+./decant             # export ALL runtime icons → ./icons/
+./decant --list      # list every extractable icon in your iOS runtime
+./decant Maps        # just one → ./Maps.icon, then: open Maps.icon
 ```
 
 The runtime location is discovered automatically — you only need an iOS 26+ simulator installed in the standard place (Xcode › Settings › Components). The extractor binary is compiled on first run.
@@ -19,19 +19,19 @@ The runtime location is discovered automatically — you only need an iOS 26+ si
 ## Usage
 
 ```
-./reverse-icon.sh                                # export ALL → ./icons
-./reverse-icon.sh --all [outdir]                 # export ALL → outdir
-./reverse-icon.sh --list                         # list available icons + stack names
-./reverse-icon.sh <AppName|path> [Stack] [out.icon] [--preview]
+./decant                                # export ALL → ./icons
+./decant --all [outdir]                 # export ALL → outdir
+./decant --list                         # list available icons + stack names
+./decant <AppName|path> [Stack] [out.icon] [--preview]
 ```
 
 `AppName` is a system app by name (`Maps`, `Photos`, `Safari`, `Settings`, …), resolved automatically inside the newest installed iOS simulator runtime; common friendly names are aliased to their real bundles (Safari→MobileSafari, Settings→Preferences, Messages→MobileSMS, Calendar→MobileCal, Wallet→Passbook), and `--list` shows the exact bundle names. Alternatively pass an explicit `Assets.car` / `.app` / `.framework` / `.bundle` path. `Stack` is the icon stack name (default `AppIcon`; Safari and Passwords use `AppIconUpdated`, Settings uses `Settings`). `out.icon` defaults to `./<name>.icon`. Add `--preview` to also write a flattened `<name>-preview.png` (off by default).
 
 ```sh
-./reverse-icon.sh Photos
-./reverse-icon.sh Safari AppIconUpdated
-./reverse-icon.sh Settings Settings ~/Desktop/Settings.icon --preview
-./reverse-icon.sh /path/to/Assets.car AppIcon ~/Desktop/My.icon   # explicit path
+./decant Photos
+./decant Safari AppIconUpdated
+./decant Settings Settings ~/Desktop/Settings.icon --preview
+./decant /path/to/Assets.car AppIcon ~/Desktop/My.icon   # explicit path
 ```
 
 ## Requirements
@@ -40,7 +40,7 @@ macOS with Xcode 26+ command-line tools (`clang`, `actool`, `assetutil`) and `py
 
 ## Files
 
-`reverse-icon.sh` is the entry point: it discovers the runtime, resolves the app, extracts, assembles, and validates. `icon-extract.m` is the CoreUI-based extractor (built for the iOS simulator and run inside it) that writes `extracted.json` plus the layer assets. `build-icon.py` is the assembler that turns `extracted.json` + assets into `icon.json` + `Assets/`. Running `./reverse-icon.sh` with no args generates every extractable icon into `icons/`, which is gitignored — regenerate anytime, and nothing of Apple's gets committed.
+`decant` is the entry point: it discovers the runtime, resolves the app, extracts, assembles, and validates. `icon-extract.m` is the CoreUI-based extractor (built for the iOS simulator and run inside it) that writes `extracted.json` plus the layer assets. `build-icon.py` is the assembler that turns `extracted.json` + assets into `icon.json` + `Assets/`. Running `./decant` with no args generates every extractable icon into `icons/`, which is gitignored — regenerate anytime, and nothing of Apple's gets committed.
 
 ## How it works
 

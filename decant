@@ -1,5 +1,5 @@
 #!/bin/zsh
-# reverse-icon.sh — reverse-engineer a compiled Apple "Liquid Glass" app icon
+# decant — reverse-engineer a compiled Apple "Liquid Glass" app icon
 # (iOS/macOS 26+ .icon) back into an editable .icon bundle you can open in Icon
 # Composer. Reads the compiled icon out of an installed iOS simulator runtime via
 # the private CoreUI framework, dumps every layer (SVG/PNG) plus its blend mode,
@@ -7,10 +7,10 @@
 # per-appearance (light/dark/tinted) fills, and reassembles icon.json + Assets/.
 #
 # Usage:
-#   ./reverse-icon.sh                         # export ALL runtime icons -> ./icons
-#   ./reverse-icon.sh --all [outdir]          # same, to a chosen dir
-#   ./reverse-icon.sh --list                  # list extractable icons in the runtime
-#   ./reverse-icon.sh <AppName|path> [Stack] [out.icon] [--preview]
+#   ./decant                         # export ALL runtime icons -> ./icons
+#   ./decant --all [outdir]          # same, to a chosen dir
+#   ./decant --list                  # list extractable icons in the runtime
+#   ./decant <AppName|path> [Stack] [out.icon] [--preview]
 #
 #   AppName     System app by name (Maps, Photos, Contacts…), resolved inside the
 #               newest installed iOS simulator runtime. Or an explicit
