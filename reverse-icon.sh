@@ -1,0 +1,229 @@
+#!/bin/zsh
+# reverse-icon.sh — reverse-engineer a compiled Apple "Liquid Glass" app icon
+# (iOS/macOS 26+ .icon) back into an editable .icon bundle you can open in Icon
+# Composer. Reads the compiled icon out of an installed iOS simulator runtime via
+# the private CoreUI framework, dumps every layer (SVG/PNG) plus its blend mode,
+# opacity, translucency, specular, shadow, blur, refraction, glass and
+# per-appearance (light/dark/tinted) fills, and reassembles icon.json + Assets/.
+#
+# Usage:
+#   ./reverse-icon.sh                         # export ALL runtime icons -> ./icons
+#   ./reverse-icon.sh --all [outdir]          # same, to a chosen dir
+#   ./reverse-icon.sh --list                  # list extractable icons in the runtime
+#   ./reverse-icon.sh <AppName|path> [Stack] [out.icon] [--preview]
+#
+#   AppName     System app by name (Maps, Photos, Contacts…), resolved inside the
+#               newest installed iOS simulator runtime. Or an explicit
+#               Assets.car / .app / .framework / .bundle path.
+#   Stack       Icon stack name (default AppIcon; Safari/Passwords use
+#               AppIconUpdated, Settings uses Settings). See --list.
+#   out.icon    Destination (default ./<name>.icon).
+#   --preview   Also write a flattened <name>-preview.png (off by default).
+#
+# Requires: macOS + Xcode 26+ tools (clang, actool, assetutil), python3, and an
+# installed iOS 26+ simulator runtime. Uses private frameworks (CoreUI/CoreSVG)
+# for research/interop on your own machine — don't ship the binaries or
+# redistribute extracted Apple artwork.
+set -e
+HERE="${0:A:h}"
+EXTRACT_SRC="$HERE/icon-extract.m"
+EXTRACT_BIN="$HERE/.icon-extract.bin"
+SIM_BIN="$HERE/.icon-extract-sim.bin"
+BUILDER="$HERE/build-icon.py"
+die() { print -u2 "error: $*"; exit 1; }
+
+# --- locate the newest installed iOS simulator RuntimeRoot --------------------
+runtime_root() {
+  local mp
+  mp=$(xcrun simctl runtime list -j 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin); best=None
+for v in d.values():
+    rid=v.get("runtimeIdentifier","")
+    if ".iOS-" not in rid: continue
+    mp=v.get("mountPath") or v.get("path")
+    if not mp: continue
+    try: ver=tuple(int(x) for x in rid.split(".iOS-")[1].split("-"))
+    except Exception: ver=(0,)
+    if best is None or ver>best[0]: best=(ver,mp)
+print(best[1] if best else "")') || return 1
+  [[ -z "$mp" ]] && return 1
+  local r
+  for r in "$mp"/Library/Developer/CoreSimulator/Profiles/Runtimes/*.simruntime/Contents/Resources/RuntimeRoot \
+           "$mp"/Contents/Resources/RuntimeRoot; do
+    [[ -d "$r" ]] && { echo "$r"; return 0; }
+  done
+  r=$(/usr/bin/find "$mp" -maxdepth 8 -type d -name RuntimeRoot 2>/dev/null | head -1)
+  [[ -d "$r" ]] && { echo "$r"; return 0; }
+  return 1
+}
+
+resolve_app() {  # <root> <name> -> bundle path
+  local root="$1" name="$2" hit sub
+  # Friendly aliases for system apps whose bundle name differs from the app name.
+  typeset -A alias
+  alias=( messages MobileSMS calendar MobileCal settings Preferences
+          wallet Passbook safari MobileSafari clock MobileTimer
+          weather WeatherPosterApp shazam ShazamEventsApp imageplayground "Image Playground" )
+  local key=${(L)name}
+  [[ -n "${alias[$key]}" ]] && name="${alias[$key]}"
+  # 1) exact .app in the usual locations
+  for sub in Applications System/Applications System/Library/CoreServices; do
+    hit=$(/usr/bin/find "$root/$sub" -maxdepth 1 -iname "$name.app" 2>/dev/null | head -1)
+    [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+  done
+  # 2) exact .app/.bundle anywhere (shallowest)
+  hit=$(/usr/bin/find "$root" -maxdepth 5 \( -iname "$name.app" -o -iname "$name.bundle" \) 2>/dev/null \
+        | awk -F/ '{print NF"\t"$0}' | sort -n | head -1 | cut -f2-)
+  [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+  # 3) substring fallback (e.g. "Safari" -> MobileSafari.app)
+  hit=$(/usr/bin/find "$root/Applications" "$root/System/Applications" -maxdepth 1 -iname "*$name*.app" 2>/dev/null \
+        | awk -F/ '{print NF"\t"$0}' | sort -n | head -1 | cut -f2-)
+  [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+  return 1
+}
+
+primary_stack() {  # <car> -> preferred IconImageStack name
+  xcrun assetutil --info "$1" 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit()
+n=[e.get("Name") for e in d[1:] if e.get("AssetType")=="IconImageStack"]
+for pref in ("AppIcon","AppIconUpdated"):
+    if pref in n: print(pref); sys.exit()
+print(n[0] if n else "")'
+}
+
+car_in() {  # <app-or-car> -> shallowest Assets.car
+  if [[ -d "$1" ]]; then
+    /usr/bin/find "$1" -name 'Assets.car' 2>/dev/null \
+      | awk -F/ '{print NF"\t"$0}' | sort -n | head -1 | cut -f2-
+  elif [[ "$1" == *.car ]]; then echo "$1"; fi
+}
+
+# --- one-time setup: pick SDK/device, compile extractor, boot sim -------------
+EXTRACTOR_READY=0; MODE=""; DEV=""
+ensure_extractor() {
+  [[ "$EXTRACTOR_READY" == 1 ]] && return 0
+  local sdk
+  sdk=$(xcrun --sdk iphonesimulator --show-sdk-path 2>/dev/null)
+  DEV=$(xcrun simctl list devices available 2>/dev/null \
+        | awk '/-- iOS (2[6-9]|[3-9][0-9])/{f=1} /^-- /{if($0 !~ /iOS (2[6-9]|[3-9][0-9])/) f=0} f && match($0,/[0-9A-F-]{36}/){print substr($0,RSTART,RLENGTH); exit}')
+  if [[ -n "$sdk" && -n "$DEV" ]]; then
+    MODE=sim
+    if [[ ! -x "$SIM_BIN" || "$EXTRACT_SRC" -nt "$SIM_BIN" ]]; then
+      print "Compiling simulator extractor…"
+      clang -fobjc-arc -target arm64-apple-ios26.0-simulator -isysroot "$sdk" \
+        -framework Foundation -framework CoreGraphics -framework ImageIO -framework UIKit \
+        "$EXTRACT_SRC" -o "$SIM_BIN" || die "failed to compile simulator extractor"
+    fi
+    xcrun simctl bootstatus "$DEV" -b >/dev/null 2>&1 || true   # boot ONCE
+  else
+    MODE=host
+    if [[ ! -x "$EXTRACT_BIN" || "$EXTRACT_SRC" -nt "$EXTRACT_BIN" ]]; then
+      print "Compiling host extractor…"
+      clang -fobjc-arc -framework Foundation -framework CoreGraphics \
+            -framework ImageIO -framework AppKit "$EXTRACT_SRC" -o "$EXTRACT_BIN" \
+        || die "failed to compile $EXTRACT_SRC"
+    fi
+    print "⚠ No iOS 26+ simulator found — using host CoreUI (refraction/specular-location may be missing)."
+  fi
+  EXTRACTOR_READY=1
+}
+
+run_extractor() {  # <car> <stack> <workdir>
+  if [[ "$MODE" == sim ]]; then xcrun simctl spawn "$DEV" "$SIM_BIN" "$1" "$2" "$3"
+  else "$EXTRACT_BIN" "$1" "$2" "$3"; fi
+}
+
+# --- build one .icon. Sets REASON on failure. Returns 0 on success ------------
+REASON=""
+build_one() {  # <car> <stack> <out.icon> <preview 0|1>
+  local car="$1" stack="$2" out="$3" preview="$4" stem="${3:t:r}"
+  local work val; work=$(mktemp -d); val=$(mktemp -d)
+  REASON=""
+  { run_extractor "$car" "$stack" "$work" >/dev/null 2>&1; } || { REASON="extraction failed"; rm -rf "$work" "$val"; return 1; }
+  python3 -c 'import json,sys;d=json.load(open(sys.argv[1]+"/extracted.json"));sys.exit(0 if any(isinstance(v,dict) and "groups" in v for v in d.values()) else 7)' "$work" \
+    || { REASON="stack '$stack' not found"; rm -rf "$work" "$val"; return 1; }
+  rm -rf "$out"
+  python3 "$BUILDER" "$work" "$out" >/dev/null || { REASON="assembly failed"; rm -rf "$work" "$val"; return 1; }
+  if xcrun actool --compile "$val" "$out" --platform iphoneos --minimum-deployment-target 26.0 \
+       --app-icon "$stem" --output-partial-info-plist "$val/p.plist" >/dev/null 2>"$val/err"; then
+    if [[ "$preview" == 1 ]]; then
+      local pv; pv=$(/usr/bin/find "$val" -name '*~ipad.png' -print -quit 2>/dev/null)
+      [[ -n "$pv" ]] && cp "$pv" "${out:r}-preview.png"
+    fi
+    rm -rf "$work" "$val"; return 0
+  fi
+  REASON=$(grep -iE "too many|require|Unsupported|not " "$val/err" | head -1 | sed 's/<[^>]*>//g;s/^[[:space:]]*//')
+  [[ -z "$REASON" ]] && REASON="actool rejected"
+  rm -rf "$out" "$work" "$val"; return 1
+}
+
+# ============================ modes ===========================================
+
+if [[ "$1" == "--list" ]]; then
+  ROOT=$(runtime_root) || die "no iOS simulator runtime found (install one via Xcode › Settings › Components)"
+  print "iOS simulator runtime: $ROOT\n"
+  for dir in "$ROOT"/Applications/*.app(N) "$ROOT"/System/Applications/*.app(N); do
+    car="$dir/Assets.car"; [[ -f "$car" ]] || continue
+    s=$(xcrun assetutil --info "$car" 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit()
+print(",".join(sorted({e.get("Name") for e in d[1:] if e.get("AssetType")=="IconImageStack"})))')
+    [[ -n "$s" ]] && printf "  %-28s %s\n" "${dir:t:r}" "$s"
+  done
+  print "\nExtract one:  $0 <AppName> [stack]      Export all:  $0"
+  exit 0
+fi
+
+# flags
+PREVIEW=0; ALL=0; POS=()
+for a in "$@"; do
+  case "$a" in
+    --preview) PREVIEW=1 ;;
+    --all)     ALL=1 ;;
+    *)         POS+=("$a") ;;
+  esac
+done
+
+# No app name (or --all) → export every icon-bearing app in the runtime.
+if [[ "$ALL" == 1 || ${#POS[@]} -eq 0 ]]; then
+  OUTDIR="${POS[1]:-$PWD/icons}"; mkdir -p "$OUTDIR"
+  ROOT=$(runtime_root) || die "no iOS simulator runtime found"
+  ensure_extractor
+  print "Exporting all icons → $OUTDIR\n"
+  ok=0; skip=0
+  for dir in "$ROOT"/Applications/*.app(N) "$ROOT"/System/Applications/*.app(N); do
+    car="$dir/Assets.car"; [[ -f "$car" ]] || continue
+    stack=$(primary_stack "$car"); [[ -n "$stack" ]] || continue
+    name="${dir:t:r}"
+    if build_one "$car" "$stack" "$OUTDIR/$name.icon" "$PREVIEW"; then
+      printf "  ✓ %s\n" "$name"; ok=$((ok+1))
+    else
+      printf "  – %-26s skipped (%s)\n" "$name" "$REASON"; skip=$((skip+1))
+    fi
+  done
+  print "\nDone: $ok exported, $skip skipped → $OUTDIR"
+  exit 0
+fi
+
+# single icon
+INPUT="${POS[1]}"; ICON_NAME="${POS[2]:-AppIcon}"; OUTPUT="${POS[3]}"
+if [[ -e "$INPUT" ]]; then TARGET="$INPUT"
+else
+  ROOT=$(runtime_root) || die "no iOS simulator runtime found; pass an explicit path instead"
+  TARGET=$(resolve_app "$ROOT" "$INPUT") || die "couldn't find '$INPUT' in the runtime — try '$0 --list'"
+  print "Resolved '$INPUT' → ${TARGET#$ROOT/}"
+fi
+CAR=$(car_in "$TARGET"); [[ -n "$CAR" && -f "$CAR" ]] || die "no Assets.car found for $TARGET"
+[[ -n "$OUTPUT" ]] || OUTPUT="$PWD/${INPUT:t:r}.icon"
+
+ensure_extractor
+print "Extracting '$ICON_NAME'…"
+if build_one "$CAR" "$ICON_NAME" "$OUTPUT" "$PREVIEW"; then
+  print "✓ Validated.  open \"$OUTPUT\""
+else
+  die "$REASON"
+fi

@@ -1,0 +1,9 @@
+# generated icon bundles (regenerate with ./reverse-icon.sh)
+icons/
+# compiled extractor binaries (rebuilt on first run)
+.icon-extract.bin
+.icon-extract-sim.bin
+# flattened previews (opt-in via --preview)
+*-preview.png
+# macOS
+.DS_Store
